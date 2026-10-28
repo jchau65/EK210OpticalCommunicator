@@ -5,7 +5,7 @@
 // ---------------- Protocol  ----------------
 const uint16_t BEACON_ADDR = 0x45;
 const uint16_t BASE_ADDR   = 0x46;
-const uint16_t BEACON_DATA_ADDR = 0x47; 
+//const uint16_t BEACON_DATA_ADDR = 0x47; didn't end up using this but will keep it for now 
 
 const uint8_t CMD_PING          = 0x11;  // beacon -> base
 const uint8_t CMD_CONNECTED     = 0x12;  // base -> beacon
@@ -13,7 +13,8 @@ const uint8_t CMD_RECEIVED      = 0x13;  // acknowledgment, both directions
 const uint8_t CMD_BEARING_START = 0x97;  // base -> beacon, followed by a value frame and a check frame
 const uint8_t CMD_START         = 0x98;  // beacon -> base, before the 10 digits
 const uint8_t CMD_END           = 0x99;  // beacon -> base, after the 10 digits
-// digits are sent as commands 0x00-0x09
+// digits have to have their position encoded so the base station can reconstruct the correct data despite lost frames
+const uint8_t DIGIT_BASE        = 0x20;
 
 const float BEARING_BIAS = 64.0;  // bearing byte = (bearing + 64) * 2, covers -64 to +63.5 deg at 0.5 deg resolution
 
@@ -43,6 +44,7 @@ const unsigned long BEARING_WAIT_MS = 1000; // wait for a bearing broadcast
 const unsigned long DATA_TIMEOUT_MS = 300;  // max wait between the bearing's value and check frames
 const unsigned long FRAME_GAP_MS    = 40;   // gap between consecutive frames we send
 const unsigned long REPLY_DELAY_MS  = 20;   // pause before replying, so the base can clear its own echo
+const unsigned long CONNECT_SETTLE_MS = 150; // tiem to wait for connetion to settle so that beacon doesn't get stuck in sending code
 
 // ---------------- State ----------------
 enum State { ENTER_CODE, PINGING, SENDING_CODE, RECEIVING_BEARING, DONE };
@@ -73,6 +75,8 @@ bool listenForBase(unsigned long ms, uint8_t &cmd) {
                    //&& !(d.flags & IRDATA_FLAGS_IS_REPEAT); was causing issues due to short command bursts
       cmd = d.command;
 
+      IrReceiver.resume();
+
       // Debug information
       Serial.print(F("rx addr 0x")); 
       Serial.print(d.address, HEX);
@@ -81,8 +85,6 @@ bool listenForBase(unsigned long ms, uint8_t &cmd) {
       Serial.print(F(" pro "));
       Serial.println(getProtocolString(d.protocol));
 
-
-      IrReceiver.resume();
       if (valid) return true; // only functions when the signal is valid
     }
   }
@@ -203,6 +205,7 @@ void loop() {
           || readSerialLine() == "CONNECTED") {  // test hook
         state = SENDING_CODE;
         lcd.clear();
+        delay(CONNECT_SETTLE_MS);
         break;
       }
       showAnimated(F("Waiting"));
@@ -214,7 +217,7 @@ void loop() {
       sendToBase(CMD_START);
       delay(FRAME_GAP_MS);
       for (int i = 0; i < CODE_LENGTH; i++) {
-        sendToBase(code[i] - '0');  // '7' -> 0x07
+         sendToBase(DIGIT_BASE + i * 10 + (code[i] - '0'));  //position-encoded, e.g. 3rd digit '7' -> 0x20 + 20 + 7
         delay(FRAME_GAP_MS);
       }
       sendToBase(CMD_END);
