@@ -12,9 +12,10 @@ const uint8_t CMD_RECEIVED      = 0x13;  // acknowledgment, both directions
 const uint8_t CMD_BEARING_START = 0x97;  // base -> beacon, followed by a value frame and a check frame
 const uint8_t CMD_START         = 0x98;  // beacon -> base, before the 10 digits
 const uint8_t CMD_END           = 0x99;  // beacon -> base, after the 10 digits
-// digits arrive as commands 0x00-0x09
+// below command is for position encoding because too many packets were lost in testing for a 10 digit sequence straight
+const uint8_t DIGIT_BASE        = 0x20;
 
-const float BEARING_BIAS = 64.0;  // bearing byte = (bearing + 64) * 2, covers -64 to +63.5 deg at 0.5 deg resolution
+const float BEARING_BIAS = 64.0; // Higher number means more precise for bearing
 
 // ---------------- Hardware ----------------
 const int STEPS_PER_REV = 2048;
@@ -22,11 +23,11 @@ Stepper myStepper(STEPS_PER_REV, 8, 10, 9, 11);
 const int STEPPER_PINS[] = {8, 9, 10, 11};
 
 const int RECEIVER_PIN = 2;
-const int EMITTER_PIN  = 4;
+const int EMITTER_PIN  = 3;
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 // ---------------- Settings ----------------
-const float OFFSET_DEG = 5;                     // calibrated: how far before the beacon the first hit occurs -- lowk need to test this at different distances
+const float OFFSET_DEG = 10;                     // calibrated: how far before the beacon the first hit occurs -- lowk need to test this at different distances
 const float STEP_DEG = 2.5;                          // sweep step size
 const float SWEEP_LIMIT_DEG = 45.0 + OFFSET_DEG;  // symmetric limits so edge beacons aren't already "in view" at turnaround
 const unsigned long LISTEN_MS = 350;              // longer than the beacon's PING period
@@ -35,6 +36,7 @@ const int CODE_LENGTH = 10;
 const unsigned long ACK_LISTEN_MS  = 500;  // wait for RECEIVED after sending the bearing
 const unsigned long FRAME_GAP_MS   = 40;   // gap between consecutive frames we send
 const unsigned long REPLY_DELAY_MS = 20;   // pause before replying, so the beacon can clear its own echo
+const unsigned long ACK_SETTLE_MS  = 80; // extra pause before acknowledeing the code
 const int MAX_BEARING_TRIES = 10;
 
 // ---------------- State ----------------
@@ -47,6 +49,7 @@ float bearing = 0.0;
 
 char code[CODE_LENGTH + 1] = "";
 int codeCount = 0;
+uint16_t digitMask = 0; 
 int bearingTries = 0;
 unsigned long startTime = 0;
 
@@ -82,6 +85,8 @@ bool listenForBeacon(unsigned long ms, uint8_t &cmd) {
       bool valid = (d.protocol == NEC || d.protocol == NEC2) && d.address == BEACON_ADDR;
       cmd = d.command;
 
+      IrReceiver.resume();
+
       Serial.print(F("rx addr 0x")); Serial.print(d.address, HEX);
       Serial.print(F(" cmd 0x"));    Serial.print(d.command, HEX);
       Serial.print(F(" "));          Serial.print(getProtocolString(d.protocol));
@@ -116,6 +121,36 @@ void replyToBeacon(uint8_t cmd, int copies) {
     delay(REPLY_DELAY_MS);
     sendToBeacon(cmd);
   }
+}
+
+void ackCode() {
+  delay(ACK_SETTLE_MS);
+  replyToBeacon(CMD_RECEIVED, 2);
+}
+
+bool isDigitFrame(uint8_t cmd) {
+  return cmd >= DIGIT_BASE && cmd < DIGIT_BASE + CODE_LENGTH * 10;
+}
+
+void resetCode() {
+  for (int i = 0; i < CODE_LENGTH; i++) code[i] = '-';
+  code[CODE_LENGTH] = '\0';
+  digitMask = 0;
+  codeCount = 0;
+}
+
+void showDigits(); //predeclaring
+
+// Stores one digit in its slot. Duplicates just overwrite; codeCount only counts new slots.
+void storeDigit(uint8_t cmd) {
+  uint8_t v = cmd - DIGIT_BASE;
+  uint8_t pos = v / 10;
+  code[pos] = '0' + (v % 10);
+  if (!(digitMask & (1 << pos))) {
+    digitMask |= (1 << pos);
+    codeCount++;
+  }
+  showDigits();  // only redraw when something changed (I2C LCD writes are slow)
 }
 
 String readSerialLine() {
@@ -260,35 +295,39 @@ void loop() {
         if (cmd == CMD_PING) {
           replyToBeacon(CMD_CONNECTED, 1);
         } else if (cmd == CMD_START) {
-          codeCount = 0;
+          resetCode();
           state = RECEIVING_CODE;
           newStage();
+          showDigits();
+        }
+
+        else if (isDigitFrame(cmd)) {
+          resetCode();
+          state = RECEIVING_CODE;
+          newStage();
+          storeDigit(cmd);
         }
       }
       break;
 
     case RECEIVING_CODE:
       showAnimated(F("Getting code"));
-      showDigits();
       if (listenForBeacon(1000, cmd)) {
         if (cmd == CMD_START) {
-          codeCount = 0;                               // fresh attempt
-        } else if (cmd <= 9) {
-          if (codeCount < CODE_LENGTH) code[codeCount] = '0' + cmd;
-          codeCount++;
+        } else if (isDigitFrame(cmd)) {
+          storeDigit(cmd);                             
         } else if (cmd == CMD_END) {
           if (codeCount == CODE_LENGTH) {
             code[CODE_LENGTH] = '\0';
             Serial.print(F("Code received: ")); Serial.println(code);
-            replyToBeacon(CMD_RECEIVED, 2);
+            ackCode();                                
             bearingTries = 0;
             state = SENDING_BEARING;
             newStage();
             showValue(F("Bearing: "), bearing);
           } else {
-            Serial.print(F("Bad code (")); Serial.print(codeCount);
+            Serial.print(F("Incomplete code (")); Serial.print(codeCount);
             Serial.println(F(" digits), waiting for resend"));
-            codeCount = 0;                             // beacon resends after its 500 ms timeout
           }
         } else if (cmd == CMD_PING) {
           replyToBeacon(CMD_CONNECTED, 1);             // beacon missed our CONNECTED
@@ -313,7 +352,7 @@ void loop() {
           break;
         }
         // END means the beacon is resending the code: our RECEIVED was lost
-        replyToBeacon(CMD_RECEIVED, 2);
+        ackCode();
       }
 
       if (bearingTries >= MAX_BEARING_TRIES) finish(false);
@@ -323,7 +362,7 @@ void loop() {
     case DONE:
       // If the beacon is still resending its code, acknowledge it again.
       if (waitForBeacon(1000, CMD_END, CMD_END, cmd)) {
-        replyToBeacon(CMD_RECEIVED, 2);
+        ackCode();
       }
 
       releaseCoils(); // so I can adjust for the next test
